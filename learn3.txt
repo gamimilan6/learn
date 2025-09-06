@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""
+connect_product.py
+
+MQTT product simulator with:
+ - MQTT v3.1
+ - TLS 1.2 with server cert verification using Linuxcafilename/RootCAName from env.json
+ - Enforced cipher suites per device spec
+ - Username/password auth from env.json
+ - Disconnect & reconnect every 24 hours (session duration rule)
+"""
+
+import json
+import logging
+import ssl
+import time
+import threading
+from pathlib import Path
+import paho.mqtt.client as mqtt
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger("product-mqtt")
+
+BASE = Path(__file__).parent
+ENV_FILE = BASE / "env.json"
+PROFILE_FILE = BASE / "profile.json"
+PERSIST_FILE = BASE / "persist.json"
+
+# session duration in seconds (24 hours)
+SESSION_SECONDS = 24 * 3600
+
+def load_json(p: Path):
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning("Failed to parse %s: %s", p.name, e)
+        return {}
+
+def find_ca_file(env):
+    linux_ca = env.get("Linuxcafilename") or env.get("linuxcafilename")
+    root_ca = env.get("RootCAName") or env.get("rootCAName") or env.get("RootCA")
+    # try linux_ca absolute, then relative
+    if linux_ca:
+        p = Path(linux_ca)
+        if p.is_file():
+            return str(p)
+        rp = BASE / linux_ca
+        if rp.is_file():
+            return str(rp)
+    # try root_ca
+    if root_ca:
+        p = Path(root_ca)
+        if p.is_file():
+            return str(p)
+        rp = BASE / root_ca
+        if rp.is_file():
+            return str(rp)
+    return None
+
+def build_config(env, profile, persist):
+    host = env.get("RemoteServiceBootstrapBrokerHostName") or env.get("MQTTHostname") or "localhost"
+    secure_port = env.get("SecureMQTTPort") or env.get("secureMQTTPort")
+    bootstrap_port = env.get("RemoteServiceBootstrapBrokerPort") or env.get("RemoteServiceBootstrapBrokerPort")
+    port = int(secure_port or bootstrap_port or 8883)
+
+    username = env.get("RemoteServiceBootstrapBrokerUsername") or env.get("MQTTUsername")
+    password = env.get("RemoteServiceBootstrapBrokerPassword") or env.get("MQTTPassword")
+
+    serial = env.get("SerialNumber") or "unknown-serial"
+    # ownership info
+    rso = env.get("RemoteServiceOwnershipInfo") if isinstance(env, dict) else None
+    org = None
+    if isinstance(rso, dict):
+        org = rso.get("organization") or rso.get("Organization")
+    org = org or env.get("organization") or env.get("Organization") or "unknown-org"
+
+    # topics
+    bootstrap_topic = "device/bootstrap"
+    subscribe_topic = f"device/{serial}/#"
+
+    return {
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+        "serial": str(serial),
+        "organization": str(org),
+        "bootstrap_topic": bootstrap_topic,
+        "subscribe_topic": subscribe_topic
+    }
+
+def make_tls_context(ca_path: str | None):
+    # Use PROTOCOL_TLS_CLIENT and restrict older versions (allow TLS 1.2 and above)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.options |= ssl.OP_NO_TLSv1
+    ctx.options |= ssl.OP_NO_TLSv1_1
+    # (do not force-disable TLS 1.3 unless your broker cannot handle it)
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.check_hostname = True
+
+    if ca_path:
+        ctx.load_verify_locations(cafile=ca_path)
+        log.info("Loaded CA file: %s", ca_path)
+    else:
+        log.info("No CA file provided; using system CA store")
+
+    # Map the spec ciphers to OpenSSL cipher strings:
+    # TLS_DHE_RSA_WITH_AES_256_GCM_SHA384 => DHE-RSA-AES256-GCM-SHA384
+    # TLS_DHE_RSA_WITH_AES_128_GCM_SHA256 => DHE-RSA-AES128-GCM-SHA256
+    # TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => ECDHE-RSA-AES256-GCM-SHA384
+    # TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => ECDHE-RSA-AES128-GCM-SHA256
+    cipher_list = ":".join([
+        "DHE-RSA-AES256-GCM-SHA384",
+        "DHE-RSA-AES128-GCM-SHA256",
+        "ECDHE-RSA-AES256-GCM-SHA384",
+        "ECDHE-RSA-AES128-GCM-SHA256"
+    ])
+    try:
+        ctx.set_ciphers(cipher_list)
+        log.info("Set TLS cipher list to: %s", cipher_list)
+    except Exception as e:
+        log.warning("Failed to set cipher list: %s. Broker may accept defaults.", e)
+
+    return ctx
+
+class ProductClient:
+    def __init__(self, cfg, ca_path):
+        self.cfg = cfg
+        self.ca_path = ca_path
+        self.client = mqtt.Client(client_id=f"device-{cfg['serial']}", protocol=mqtt.MQTTv31, clean_session=True)
+        if cfg["username"] and cfg["password"]:
+            # some systems require tenant/user combination — if your env has tenant, modify here
+            tenant = None
+            # attempt to read tenant from env if present
+            tenant = env_json.get("RemoteServiceBootstrapTenantId") or env_json.get("TenantId")
+            if tenant:
+                # example format tenant/username if broker expects it
+                usr = f"{tenant}/{cfg['username']}"
+            else:
+                usr = cfg["username"]
+            self.client.username_pw_set(usr, cfg["password"])
+            log.info("Using username auth (username=%s)", usr)
+        else:
+            log.info("No username/password provided in env.json (will attempt anonymous if broker allows)")
+
+        # TLS
+        tls_ctx = make_tls_context(ca_path)
+        self.client.tls_set_context(tls_ctx)
+        self.client.tls_insecure_set(False)
+
+        # callbacks
+        self.client.on_connect = self.on_connect
+        self.client.on_disconnect = self.on_disconnect
+        self.client.on_message = self.on_message
+
+        # control
+        self._stop_event = threading.Event()
+        self._session_thread = None
+
+    def on_connect(self, c, userdata, flags, rc):
+        code_map = {
+            0: "Connection accepted",
+            1: "Refused: unacceptable protocol version",
+            2: "Refused: identifier rejected",
+            3: "Refused: server unavailable",
+            4: "Refused: bad username or password",
+            5: "Refused: not authorized"
+        }
+        log.info("on_connect rc=%s -> %s", rc, code_map.get(rc, "Unknown"))
+        if rc == 0:
+            c.subscribe(self.cfg["subscribe_topic"])
+            log.info("Subscribed to %s", self.cfg["subscribe_topic"])
+            payload = {
+                "SerialNumber": self.cfg["serial"],
+                "Organization": self.cfg["organization"],
+                "Timestamp": int(time.time())
+            }
+            c.publish(self.cfg["bootstrap_topic"], json.dumps(payload), qos=1)
+            log.info("Published bootstrap to %s", self.cfg["bootstrap_topic"])
+
+    def on_disconnect(self, c, userdata, rc):
+        log.warning("Disconnected (rc=%s)", rc)
+
+    def on_message(self, c, userdata, msg):
+        try:
+            txt = msg.payload.decode("utf-8", errors="replace")
+            log.info("Message on %s: %s", msg.topic, txt)
+        except Exception as e:
+            log.exception("Failed to decode message: %s", e)
+
+    def start(self):
+        # connect and run loop in background
+        log.info("Connecting to %s:%s", self.cfg["host"], self.cfg["port"])
+        try:
+            self.client.connect(self.cfg["host"], self.cfg["port"], keepalive=60)
+        except Exception as e:
+            log.exception("Socket-level connect failed: %s", e)
+            raise
+
+        # start MQTT network loop in background
+        self.client.loop_start()
+
+        # start session manager: will disconnect & reconnect every SESSION_SECONDS
+        self._session_thread = threading.Thread(target=self._session_manager, daemon=True)
+        self._session_thread.start()
+
+    def _session_manager(self):
+        """
+        Keep the session alive but enforce the 24-hour policy:
+        after SESSION_SECONDS, disconnect and reconnect to start a new session.
+        """
+        while not self._stop_event.is_set():
+            log.info("Starting a new session for %d seconds", SESSION_SECONDS)
+            # wait for SESSION_SECONDS or until stop
+            stopped = self._stop_event.wait(timeout=SESSION_SECONDS)
+            if stopped:
+                break
+            # time to rotate session: gracefully disconnect then reconnect
+            log.info("Session duration reached; rotating connection now.")
+            try:
+                self.client.disconnect()
+            except Exception as e:
+                log.warning("Error during disconnect: %s", e)
+            # small pause, then reconnect
+            time.sleep(2)
+            try:
+                self.client.reconnect()
+                log.info("Reconnected to broker to start new session.")
+            except Exception as e:
+                log.exception("Reconnect failed: %s", e)
+                # wait and try again in a few seconds
+                time.sleep(10)
+
+    def stop(self):
+        self._stop_event.set()
+        try:
+            self.client.loop_stop()
+            self.client.disconnect()
+        except Exception:
+            pass
+        if self._session_thread:
+            self._session_thread.join(timeout=2)
+
+if __name__ == "__main__":
+    # load env/profile/persist
+    env_json = load_json(ENV_FILE)
+    profile_json = load_json(PROFILE_FILE)
+    persist_json = load_json(PERSIST_FILE)
+
+    cfg = build_config(env_json, profile_json, persist_json)
+    ca = find_ca_file(env_json)
+
+    log.info("Using CA file: %s", ca if ca else "system CA store")
+    product = ProductClient(cfg, ca)
+
+    try:
+        product.start()
+        # run until user interrupt
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log.info("Interrupted by user, shutting down.")
+    finally:
+        product.stop()
