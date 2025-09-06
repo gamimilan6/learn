@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""
+connect_final.py
+
+Final cleaned script:
+ - Reads env.json (primary) and optional profile.json / persist.json (fallbacks)
+ - Finds CA via env keys: Linuxcafilename, linuxCaFileName, RootCAName, rootCAName (absolute or relative)
+ - Enforces TLS verification with TLS1.2+ (uses system CA store if no CA file found)
+ - Uses MQTT v3.1.1 (paho-mqtt)
+ - Publishes a bootstrap JSON payload and subscribes to device/<serial>/#
+"""
+
+import json
+import logging
+import ssl
+import time
+from pathlib import Path
+import paho.mqtt.client as mqtt
+
+# ---------- Logging ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger("connect-final")
+
+# ---------- Files ----------
+BASE = Path(__file__).parent
+ENV_FILE = BASE / "env.json"
+PROFILE_FILE = BASE / "profile.json"
+PERSIST_FILE = BASE / "persist.json"
+
+# ---------- Helpers ----------
+def load_json(path):
+    if not path.exists():
+        log.debug("Not found: %s", path)
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning("Failed to load/parse %s: %s", path.name, e)
+        return {}
+
+def find_ca_file(env):
+    """
+    Search for a CA file using common env keys and return a path string or None.
+    Order:
+      1. Linuxcafilename (absolute)
+      2. linuxCaFileName (absolute)
+      3. Linuxcafilename relative to script
+      4. linuxCaFileName relative to script
+      5. RootCAName relative/absolute
+      6. rootCAName relative/absolute
+      7. None -> use system CA store
+    """
+    candidates = []
+    if not isinstance(env, dict):
+        return None
+
+    # possible keys/cases
+    keys = ["Linuxcafilename", "linuxCaFileName", "linuxcafilename", "LinuxCaFileName",
+            "RootCAName", "rootCAName", "RootCA", "rootCA"]
+    for k in keys:
+        v = env.get(k)
+        if v:
+            candidates.append(v)
+
+    for entry in candidates:
+        p = Path(entry)
+        if p.is_file():
+            log.info("Using CA file (absolute): %s", p)
+            return str(p)
+        # try relative to script folder
+        pres = BASE / entry
+        if pres.is_file():
+            log.info("Using CA file (relative): %s", pres)
+            return str(pres)
+
+    # no file found
+    log.info("No CA file found in env.json keys. Will use system CA store.")
+    return None
+
+def first_of(dicts, *keys, default=None):
+    for d in dicts:
+        if not isinstance(d, dict):
+            continue
+        for k in keys:
+            if k in d:
+                return d[k]
+    return default
+
+def build_config(env, profile, persist):
+    host = first_of([env, profile, persist], "RemoteServiceBootstrapBrokerHostName", "MQTTHostname", default=None) or "localhost"
+    secure_port = first_of([env, profile, persist], "SecureMQTTPort", "secureMQTTPort", default=None)
+    bootstrap_port = first_of([env, profile, persist], "RemoteServiceBootstrapBrokerPort", default=None)
+    port = int(secure_port or bootstrap_port or 8883)
+
+    username = first_of([env, profile, persist], "RemoteServiceBootstrapBrokerUsername", "MQTTUsername", default=None)
+    password = first_of([env, profile, persist], "RemoteServiceBootstrapBrokerPassword", "MQTTPassword", default=None)
+
+    serial = first_of([env, profile, persist], "SerialNumber", default="unknown-serial")
+    rso = env.get("RemoteServiceOwnershipInfo") if isinstance(env, dict) else None
+    org = None
+    if isinstance(rso, dict):
+        org = rso.get("organization") or rso.get("Organization")
+    org = org or first_of([env, profile, persist], "organization", "Organization", default="unknown-org")
+
+    return {
+        "host": host,
+        "port": int(port),
+        "username": username,
+        "password": password,
+        "serial": str(serial),
+        "organization": str(org),
+        "bootstrap_topic": "device/bootstrap",
+        "subscribe_topic": f"device/{serial}/#"
+    }
+
+def make_tls_context(ca_path):
+    """
+    Create SSLContext with TLS1.2+ and certificate verification.
+    If ca_path is None -> use system CA store.
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    # disallow old insecure protocols
+    ctx.options |= ssl.OP_NO_TLSv1
+    ctx.options |= ssl.OP_NO_TLSv1_1
+    # keep TLSv1.2 and TLSv1.3 allowed by default
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.check_hostname = True
+
+    if ca_path:
+        try:
+            ctx.load_verify_locations(cafile=ca_path)
+            log.info("Loaded CA file: %s", ca_path)
+        except Exception as e:
+            log.exception("Failed to load CA file %s: %s", ca_path, e)
+            raise
+    else:
+        log.info("Using system CA store for verification.")
+
+    return ctx
+
+# ---------- Main ----------
+def main():
+    env = load_json(ENV_FILE)
+    profile = load_json(PROFILE_FILE)
+    persist = load_json(PERSIST_FILE)
+
+    cfg = build_config(env, profile, persist)
+    ca_path = find_ca_file(env)
+
+    log.info("Broker: %s:%s (TLS expected)", cfg["host"], cfg["port"])
+    if cfg["username"]:
+        log.info("Auth: username provided (username=%s)", cfg["username"])
+    else:
+        log.info("No username/password provided in env.json")
+
+    # Create mqtt client (MQTT v3.1.1)
+    client_id = f"device-{cfg['serial']}"
+    client = mqtt.Client(client_id=client_id, protocol=mqtt.MQTTv311, clean_session=True)
+
+    if cfg["username"] and cfg["password"]:
+        client.username_pw_set(cfg["username"], cfg["password"])
+
+    # TLS context
+    try:
+        tls_ctx = make_tls_context(ca_path)
+    except Exception:
+        log.error("TLS context creation failed. Aborting.")
+        return
+
+    client.tls_set_context(tls_ctx)
+    client.tls_insecure_set(False)  # enforce verification
+
+    # Callbacks
+    def on_connect(c, userdata, flags, rc):
+        code_map = {
+            0: "Connection accepted",
+            1: "Refused: unacceptable protocol version",
+            2: "Refused: identifier rejected",
+            3: "Refused: server unavailable",
+            4: "Refused: bad username or password",
+            5: "Refused: not authorized"
+        }
+        log.info("on_connect rc=%s -> %s", rc, code_map.get(rc, "Unknown"))
+        if rc == 0:
+            c.subscribe(cfg["subscribe_topic"])
+            log.info("Subscribed to: %s", cfg["subscribe_topic"])
+            payload = {"SerialNumber": cfg["serial"], "Organization": cfg["organization"], "Timestamp": int(time.time())}
+            c.publish(cfg["bootstrap_topic"], json.dumps(payload), qos=1)
+            log.info("Published bootstrap to %s", cfg["bootstrap_topic"])
+
+    def on_message(c, userdata, msg):
+        try:
+            txt = msg.payload.decode("utf-8", errors="replace")
+            log.info("Message on %s: %s", msg.topic, txt)
+        except Exception as e:
+            log.exception("Failed to decode message: %s", e)
+
+    def on_disconnect(c, userdata, rc):
+        log.warning("Disconnected (rc=%s)", rc)
+
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.on_disconnect = on_disconnect
+
+    # Connect
+    try:
+        client.connect(cfg["host"], cfg["port"], keepalive=60)
+    except Exception as e:
+        log.exception("Socket-level connect failed: %s", e)
+        return
+
+    try:
+        client.loop_forever()
+    except KeyboardInterrupt:
+        log.info("Interrupted by user, disconnecting")
+        client.disconnect()
+
+if __name__ == "__main__":
+    main()
