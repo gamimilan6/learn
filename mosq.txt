@@ -3,3 +3,10 @@ mosquitto_sub -h your-broker.example.com -p 8883 \
   -u "your-username" -P "your-password" \
   -V mqttv31 \
   -t "device/#" -d
+
+
+mosquitto_sub -h your-broker.example.com -p 8883 \
+  --cafile ca-certificates.crt \
+  -u "YourUsername" -P "YourPassword" \
+  -V mqttv31 \
+  -t "#" -d
