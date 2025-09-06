@@ -10,3 +10,16 @@ mosquitto_sub -h your-broker.example.com -p 8883 \
   -u "YourUsername" -P "YourPassword" \
   -V mqttv31 \
   -t "#" -d
+
+
+# raw username
+mosquitto_sub -h host -p 8883 --cafile ca-certificates.crt -u "USER" -P "PASS" -V mqttv31 -t "device/#" -d
+
+# tenant prefix
+mosquitto_sub -h host -p 8883 --cafile ca-certificates.crt -u "TENANT/USER" -P "PASS" -V mqttv31 -t "device/#" -d
+
+# username@tenant
+mosquitto_sub -h host -p 8883 --cafile ca-certificates.crt -u "USER@TENANT" -P "PASS" -V mqttv31 -t "device/#" -d
+
+# tenant:username
+mosquitto_sub -h host -p 8883 --cafile ca-certificates.crt -u "TENANT:USER" -P "PASS" -V mqttv31 -t "device/#" -d
