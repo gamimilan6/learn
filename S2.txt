@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""
+register_one_way_tls.py
+
+Simple one-way-TLS bootstrap POST using only the system/explicit CA.
+Reads env.json (same folder) for:
+ - SerialNumber (or serialNumber / Serial_number)
+ - RemoteServiceOwnershipInfo.organization OR organization
+ - BootstrapUrl OR BootstrapHost (+ BootstrapPort) + BootstrapPath
+ - optional: BootstrapUsername / BootstrapPassword (used as Basic auth if present)
+ - optional: linuxCaFileName / Linuxcafilename / RootCAName (CA file path)
+
+Sends POST JSON: {"Serial_number": "<serial>", "organization": "<org>"}
+Prints POST URL, HTTP status, response body (parsed JSON when possible).
+"""
+
+import json
+import base64
+import ssl
+import http.client
+from pathlib import Path
+from urllib.parse import urlparse
+import logging
+import sys
+
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger("register-oneway")
+
+BASE = Path(__file__).parent
+ENV_PATH = BASE / "env.json"
+
+def load_env():
+    if not ENV_PATH.exists():
+        log.error("env.json not found in script folder: %s", ENV_PATH)
+        return {}
+    try:
+        return json.loads(ENV_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.exception("Failed to read/parse env.json: %s", e)
+        return {}
+
+def pick_ca_file(env):
+    candidates = [
+        env.get("linuxCaFileName"),
+        env.get("Linuxcafilename"),
+        env.get("linuxcafilename"),
+        env.get("RootCAName"),
+        env.get("rootCAName"),
+        env.get("RootCA"),
+    ]
+    for c in candidates:
+        if not c:
+            continue
+        p = Path(c)
+        if p.is_file():
+            return str(p)
+        rp = BASE / c
+        if rp.is_file():
+            return str(rp)
+    return None
+
+def build_bootstrap_url(env):
+    # Prefer an explicit full URL
+    full = env.get("BootstrapUrl") or env.get("BootstrapAgentUrl") or env.get("bootstrapUrl")
+    if full:
+        return full
+
+    # Fallback to host + optional port + path
+    host = env.get("BootstrapHost") or env.get("BootstrapServer") or env.get("RemoteServiceBootstrapBrokerHostName")
+    if not host:
+        return None
+    path = env.get("BootstrapPath") or env.get("BootstrapAgentPath") or env.get("bootstrapPath") or "/bootstrapAgent"
+    port = env.get("BootstrapPort
