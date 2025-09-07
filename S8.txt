@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""
+simple_register.py
+
+Reads env.json from the same folder and POSTs exactly:
+  {"Serial_number": "<serial>", "organization": "<org>"}
+to the exact BootstrapUrl (or host) present in env.json.
+
+env.json keys used (any of these variants):
+ - BootstrapUrl            (preferred; may be "https://host" or "host")
+ - RemoteServiceBootstrapBrokerHostName   (fallback host)
+ - linuxCaFileName / Linuxcafilename / RootCAName  (optional CA file path)
+ - SerialNumber / serialNumber / Serial_number
+ - RemoteServiceOwnershipInfo.organization  OR organization
+
+No client cert / key is used. Only one-way TLS (server validation) is performed if CA is provided.
+"""
+
+import json, ssl, http.client, logging, sys
+from pathlib import Path
+from urllib.parse import urlparse
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger("simple-register")
+
+BASE = Path(__file__).parent
+ENV_PATH = BASE / "env.json"
+
+def load_env():
+    if not ENV_PATH.exists():
+        log.error("env.json not found in %s", BASE)
+        sys.exit(1)
+    try:
+        return json.loads(ENV_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.exception("Failed to parse env.json: %s", e)
+        sys.exit(1)
+
+def find_ca(env):
+    for k in ("linuxCaFileName","Linuxcafilename","linuxcafilename","RootCAName","rootCAName","RootCA"):
+        v = env.get(k)
+        if not v:
+            continue
+        p = Path(v)
+        if p.is_file():
+            return str(p)
+        rp = BASE / v
+        if rp.is_file():
+            return str(rp)
+    return None
+
+def build_url(env):
+    # prefer BootstrapUrl
+    raw = env.get("BootstrapUrl") or env.get("BootstrapAgentUrl")
+    if not raw:
+        # fallback to simple host field
+        raw = env.get("RemoteServiceBootstrapBrokerHostName") or env.get("MQTTHostname") or env.get("BootstrapHost")
+    if not raw:
+        return None
+    # if user provided host without scheme, add https://
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw
+    return "https://" + raw  # post to root; script will use path "/" if none present
+
+def get_serial_org(env):
+    serial = env.get("SerialNumber") or env.get("serialNumber") or env.get("Serial_number") or env.get("serial_number")
+    # organization may be nested
+    org = None
+    rso = env.get("RemoteServiceOwnershipInfo")
+    if isinstance(rso, dict):
+        org = rso.get("organization") or rso.get("Organization")
+    if not org:
+        org = env.get("organization") or env.get("Organization")
+    return serial, org
+
+def create_ssl_context(ca_file):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    # disable legacy TLSv1/1.1
+    ctx.options |= ssl.OP_NO_TLSv1
+    ctx.options |= ssl.OP_NO_TLSv1_1
+    if ca_file:
+        ctx.load_verify_locations(cafile=ca_file)
+        log.info("Loaded CA file: %s", ca_file)
+    else:
+        log.info("No CA file supplied; using system CA store")
+    return ctx
+
+def post_exact(url, payload, ca_file=None, timeout=15):
+    parsed = urlparse(url)
+    scheme = parsed.scheme or "https"
+    host = parsed.hostname
+    port = parsed.port or (443 if scheme == "https" else 80)
+    path = parsed.path or "/"   # if user only gave host, post to "/"
+    if parsed.query:
+        path += "?" + parsed.query
+
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json", "Accept": "*/*"}
+
+    log.info("POST -> %s (host=%s port=%s path=%s)", url, host, port, path)
+    log.info("Request body: %s", json.dumps(payload))
+
+    ctx = create_ssl_context(ca_file)
+
+    try:
+        if scheme == "https":
+            conn = http.client.HTTPSConnection(host, port=port, context=ctx, timeout=timeout)
+        else:
+            conn = http.client.HTTPConnection(host, port=port, timeout=timeout)
+        conn.request("POST", path, body=body, headers=headers)
+        resp = conn.getresponse()
+        status = resp.status
+        reason = resp.reason
+        resp_headers = dict(resp.getheaders())
+        raw = resp.read()
+        text = raw.decode("utf-8", errors="replace")
+        log.info("HTTP %s %s", status, reason)
+        log.info("Response headers:")
+        for k,v in resp_headers.items():
+            log.info("  %s: %s", k, v)
+        # print truncated body (up to 5000 chars) so terminal doesn't overflow
+        log.info("Response body (first 5000 chars):\n%s", text[:5000])
+        # attempt JSON parse
+        try:
+            j = json.loads(text)
+            log.info("Parsed JSON response:\n%s", json.dumps(j, indent=2))
+        except Exception:
+            log.info("Response not JSON (likely HTML or text).")
+        return status, text
+    except Exception as e:
+        log.exception("HTTP POST failed: %s", e)
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def main():
+    env = load_env()
+    url = build_url(env)
+    if not url:
+        log.error("No BootstrapUrl or host found in env.json (set BootstrapUrl or RemoteServiceBootstrapBrokerHostName). Aborting.")
+        sys.exit(1)
+
+    serial, org = get_serial_org(env)
+    if not serial:
+        log.error("SerialNumber not found in env.json (expected SerialNumber / serialNumber / Serial_number). Aborting.")
+        sys.exit(1)
+
+    if org is None:
+        log.info("Organization not found in env.json; sending empty string for organization.")
+
+    ca_file = find_ca(env) or None
+
+    payload = {"Serial_number": str(serial), "organization": "" if org is None else str(org)}
+
+    # perform POST and print results
+    post_exact(url, payload, ca_file=ca_file)
+
+if __name__ == "__main__":
+    main()
