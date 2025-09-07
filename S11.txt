@@ -1,0 +1,15 @@
+import httpx
+import json
+
+with open("env.json") as f:
+    env = json.load(f)
+
+url = env.get("BootstrapUrl") or "https://" + env["RemoteServiceBootstrapBrokerHostName"]
+payload = {
+    "Serial_number": env["SerialNumber"],
+    "organization": env.get("organization") or env.get("RemoteServiceOwnershipInfo", {}).get("organization", "")
+}
+
+resp = httpx.post(url, json=payload, verify=env.get("linuxCaFileName"))
+print("Status:", resp.status_code)
+print("Body:", resp.text)
