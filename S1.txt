@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""
+register_device_simple.py
+
+Simple bootstrap/registration POST:
+ - Reads env.json for SerialNumber and organization
+ - Posts JSON {"Serial_number": ..., "organization": ...} to a bootstrap URL
+ - Uses CA certificate file (linuxCaFileName / RootCAName) to verify TLS
+ - Prints POST URL, status, and response body
+
+Place env.json and the CA file in the same folder as this script.
+"""
+
+import json
+import base64
+import ssl
+import http.client
+from pathlib import Path
+from urllib.parse import urlparse
+import logging
+
+# --- Logging ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger("register-simple")
+
+# --- Files / defaults ---
+BASE = Path(__file__).parent
+ENV_FILE = BASE / "env.json"
+
+def load_env():
+    if not ENV_FILE.exists():
+        log.error("env.json not found in script folder (%s)", ENV_FILE)
+        return {}
+    try:
+        return json.loads(ENV_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.exception("Failed to parse env.json: %s", e)
+        return {}
+
+def find_ca_file(env):
+    # look for common names
+    candidates = [
+        env.get("linuxCaFileName"),
+        env.get("Linuxcafilename"),
+        env.get("linuxcafilename"),
+        env.get("RootCAName"),
+        env.get("rootCAName"),
+        env.get("RootCA"),
+    ]
+    for c in candidates:
+        if not c:
+            continue
+        p = Path(c)
+        if p.is_file():
+            return str(p)
+        # try relative to script dir
+        rp = BASE / c
+        if rp.is_file():
+            return str(rp)
+    return None
+
+def build_bootstrap_url(env):
+    # Prefer full URL if present
+    url = env.get("BootstrapUrl") or env.get("BootstrapAgentUrl") or env.get("bootstrapUrl")
+    if url:
+        return url
+
+    # fallback to host + path (user must set these in env.json)
+    host = env.get("BootstrapHost") or env.get("BootstrapServer") or env.get("RemoteServiceBootstrapBrokerHostName")
+    if not host:
+        return None
+    path = env.get("BootstrapPath") or env.get("BootstrapAgentPath") or env.get("bootstrapPath") or "/bootstrapAgent"
+    # allow host to contain port
+    if host.startswith("http://") or host.startswith("https://"):
+        # host already contains scheme
+        return host.rstrip("/") + path
+    # default scheme https
+    port = env.get("BootstrapPort") or env.get("bootstrapPort")
+    if port:
+        return f"https://{host.rstrip('/')}:{int(port)}{path}"
+    return f"https://{host.rstrip('/')}{path}"
+
+def create_ssl_context(ca_file):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    # disable old insecure protocol versions
+    ctx.options |= ssl.OP_NO_TLSv1
+    ctx.options |= ssl.OP_NO_TLSv1_1
+    if ca_file:
+        ctx.load_verify_locations(cafile=ca_file)
+        log.info("Using CA file: %s", ca_file)
+    else:
+        log.info("No CA file found in env.json; using system CA store")
+    return ctx
+
+def post_json(url, json_obj, ca_file=None, username=None, password=None, timeout=15):
+    parsed = urlparse(url)
+    scheme = parsed.scheme or "https"
+    host = parsed.hostname
+    port = parsed.port or (443 if scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+
+    body = json.dumps(json_obj).encode("utf-8")
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+
+    # optional Basic auth
+    if username and password:
+        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+        headers["Authorization"] = "Basic " + token
+        log.info("Will use basic auth for bootstrap (username present)")
+
+    log.info("POST -> %s (host=%s port=%s path=%s)", url, host, port, path)
+    ctx = create_ssl_context(ca_file)
+
+    if scheme == "https":
+        conn = http.client.HTTPSConnection(host, port=port, context=ctx, timeout=timeout)
+    else:
+        conn = http.client.HTTPConnection(host, port=port, timeout=timeout)
+
+    try:
+        conn.request("POST", path, body=body, headers=headers)
+        resp = conn.getresponse()
+        status = resp.status
+        data = resp.read().decode("utf-8", errors="replace")
+        log.info("HTTP status: %s", status)
+        log.info("Response body:\n%s", data)
+        # try to parse JSON
+        try:
+            return status, json.loads(data)
+        except Exception:
+            return status, data
+    finally:
+        conn.close()
+
+def main():
+    env = load_env()
+    if not env:
+        log.error("env.json empty or unreadable; aborting")
+        return
+
+    serial = env.get("SerialNumber") or env.get("serialNumber") or env.get("Serial_number") or env.get("serial_number")
+    # get organization from ownership info or direct key
+    org = None
+    rso = env.get("RemoteServiceOwnershipInfo")
+    if isinstance(rso, dict):
+        org = rso.get("organization") or rso.get("Organization")
+    org = org or env.get("organization") or env.get("Organization") or ""
+
+    if not serial:
+        log.error("SerialNumber not found in env.json (keys: SerialNumber / serialNumber / Serial_number). Aborting.")
+        return
+    if not org:
+        log.warning("Organization not found in env.json; posting empty organization field.")
+
+    bootstrap_url = build_bootstrap_url(env)
+    if not bootstrap_url:
+        log.error("Could not determine bootstrap URL from env.json. Set BootstrapUrl or BootstrapHost + BootstrapPath (+BootstrapPort). Aborting.")
+        return
+
+    ca_file = find_ca_file(env)
+    # optional bootstrap auth fields
+    bs_user = env.get("BootstrapUsername") or env.get("BootstrapUser") or env.get("RemoteServiceBootstrapBrokerUsername")
+    bs_pass = env.get("BootstrapPassword") or env.get("BootstrapPass") or env.get("RemoteServiceBootstrapBrokerPassword")
+
+    payload = {"Serial_number": str(serial), "organization": str(org)}
+
+    status, resp = post_json(bootstrap_url, payload, ca_file=ca_file, username=bs_user, password=bs_pass)
+    log.info("POST completed with HTTP status: %s", status)
+    log.info("Parsed response: %s", json.dumps(resp, indent=2) if isinstance(resp, dict) else str(resp))
+
+if __name__ == "__main__":
+    main()
