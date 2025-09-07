@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""
+post_exact_url.py
+
+POSTs {"Serial_number":..., "organization":...} to the exact BootstrapUrl in env.json.
+Prints URL used, status, response headers and body so you can see if you got HTML (login page)
+or JSON (bootstrap response).
+Uses CA from linuxCaFileName / RootCAName if present.
+"""
+
+import json, base64, ssl, http.client, logging, sys
+from pathlib import Path
+from urllib.parse import urlparse
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger("post-exact")
+
+BASE = Path(__file__).parent
+ENV = BASE / "env.json"
+
+def load_env():
+    if not ENV.exists():
+        log.error("env.json not found")
+        sys.exit(1)
+    return json.loads(ENV.read_text(encoding="utf-8"))
+
+def find_ca(env):
+    for k in ("linuxCaFileName","Linuxcafilename","linuxcafilename","RootCAName","rootCAName","RootCA"):
+        v = env.get(k)
+        if not v: continue
+        p = Path(v)
+        if p.is_file(): return str(p)
+        rp = BASE / v
+        if rp.is_file(): return str(rp)
+    return None
+
+def create_ssl_ctx(ca_file):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.options |= ssl.OP_NO_TLSv1
+    ctx.options |= ssl.OP_NO_TLSv1_1
+    if ca_file:
+        ctx.load_verify_locations(cafile=ca_file)
+        log.info("Loaded CA: %s", ca_file)
+    else:
+        log.info("No CA file found; using system CA store")
+    return ctx
+
+def post_to_url(url, payload, ca_file=None, basic_user=None, basic_pass=None, timeout=15):
+    parsed = urlparse(url)
+    scheme = parsed.scheme or "https"
+    host = parsed.hostname
+    port = parsed.port or (443 if scheme=="https" else 80)
+    path = parsed.path or "/" 
+    if parsed.query:
+        path += "?" + parsed.query
+
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type":"application/json","Accept":"*/*"}
+
+    if basic_user and basic_pass:
+        token = base64.b64encode(f"{basic_user}:{basic_pass}".encode()).decode()
+        headers["Authorization"] = "Basic " + token
+        log.info("Will send Basic auth (username present)")
+
+    log.info("POST exact URL -> %s (host=%s port=%s path=%s)", url, host, port, path)
+    ctx = create_ssl_ctx(ca_file)
+
+    if scheme == "https":
+        conn = http.client.HTTPSConnection(host, port=port, context=ctx, timeout=timeout)
+    else:
+        conn = http.client.HTTPConnection(host, port=port, timeout=timeout)
+
+    try:
+        conn.request("POST", path, body=body, headers=headers)
+        resp = conn.getresponse()
+        status = resp.status
+        reason = resp.reason
+        resp_headers = dict(resp.getheaders())
+        raw = resp.read()
+        # try decode as text
+        text = raw.decode("utf-8", errors="replace")
+        # print summary
+        log.info("HTTP %s %s", status, reason)
+        log.info("Response headers:")
+        for hk,hv in resp_headers.items():
+            log.info("  %s: %s", hk, hv)
+        log.info("Response body (first 2000 chars):\n%s", text[:2000])
+        # attempt to parse JSON
+        try:
+            j = json.loads(text)
+            log.info("Parsed JSON response:\n%s", json.dumps(j, indent=2))
+        except Exception:
+            log.info("Response not JSON (likely HTML login page or other).")
+        return status, resp_headers, text
+    finally:
+        conn.close()
+
+def main():
+    env = load_env()
+    url = env.get("BootstrapUrl")  # IMPORTANT: use exact URL provided
+    if not url:
+        log.error("Please set 'BootstrapUrl' in env.json to the exact URL you paste in browser.")
+        sys.exit(1)
+
+    serial = env.get("SerialNumber") or env.get("serialNumber") or env.get("Serial_number")
+    if not serial:
+        log.error("SerialNumber missing in env.json")
+        sys.exit(1)
+    org = None
+    rso = env.get("RemoteServiceOwnershipInfo") or {}
+    if isinstance(rso, dict):
+        org = rso.get("organization") or rso.get("Organization")
+    org = org or env.get("organization") or env.get("Organization") or ""
+
+    ca = find_ca(env)
+    bs_user = env.get("BootstrapUsername") or env.get("BootstrapUser") or env.get("RemoteServiceBootstrapBrokerUsername")
+    bs_pass = env.get("BootstrapPassword") or env.get("BootstrapPass") or env.get("RemoteServiceBootstrapBrokerPassword")
+
+    payload = {"Serial_number": str(serial), "organization": str(org)}
+    post_to_url(url, payload, ca_file=ca, basic_user=bs_user, basic_pass=bs_pass)
+
+if __name__ == "__main__":
+    main()
