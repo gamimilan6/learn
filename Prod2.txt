@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""
+bootstrap_connect_stdlib.py
+
+Bootstraps using the REST API (stdlib http.client + ssl) then connects MQTT (paho).
+This avoids 'requests/urllib3' so it won't hit the OpenSSL / urllib3 compatibility issue.
+"""
+
+import base64
+import json
+import logging
+import ssl
+import time
+from pathlib import Path
+from urllib.parse import urlparse
+
+import paho.mqtt.client as mqtt
+import http.client
+
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger("bootstrap-stdio")
+
+BASE = Path(__file__).parent
+ENV_FILE = BASE / "env.json"
+
+def load_json(path: Path):
+    if not path.exists():
+        log.warning("%s not found", path)
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+def find_ca(env):
+    linux = env.get("linuxCaFileName") or env.get("Linuxcafilename") or env.get("linuxcafilename")
+    root = env.get("RootCAName") or env.get("rootCAName") or env.get("RootCA")
+    if linux:
+        p = Path(linux)
+        if p.is_file(): return str(p)
+        rp = BASE / linux
+        if rp.is_file(): return str(rp)
+    if root:
+        p = Path(root)
+        if p.is_file(): return str(p)
+        rp = BASE / root
+        if rp.is_file(): return str(rp)
+    return None
+
+def build_bootstrap_url(env):
+    # try common keys
+    url = env.get("BootstrapUrl") or env.get("BootstrapAgentUrl") or env.get("bootstrapUrl")
+    if url:
+        return url
+    # fallbacks
+    host = env.get("BootstrapHost") or env.get("BootstrapServer") or env.get("RemoteServiceBootstrapBrokerHostName")
+    path = env.get("BootstrapPath") or "/bootstrapAgent"
+    if host:
+        if not host.startswith("http"):
+            host = "https://" + host
+        return host.rstrip("/") + path
+    # ultimate fallback: try mqtt host
+    mqtt_host = env.get("RemoteServiceBootstrapBrokerHostName") or env.get("MQTTHostname")
+    if mqtt_host:
+        return "https://" + mqtt_host.rstrip("/") + "/bootstrapAgent"
+    return None
+
+def create_ssl_context(ca_file):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.options |= ssl.OP_NO_TLSv1
+    ctx.options |= ssl.OP_NO_TLSv1_1
+    if ca_file:
+        ctx.load_verify_locations(cafile=ca_file)
+        log.info("Loaded CA file: %s", ca_file)
+    else:
+        log.info("No CA file found; using system CA store")
+    return ctx
+
+def bootstrap_post(bootstrap_url, username, password, serial, organization, ca_file):
+    """
+    POST JSON to bootstrap_url using http.client and SSLContext.
+    Returns parsed JSON.
+    """
+    if not bootstrap_url:
+        raise ValueError("No bootstrap_url provided")
+    parsed = urlparse(bootstrap_url)
+    scheme = parsed.scheme or "https"
+    host = parsed.hostname
+    port = parsed.port or (443 if scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+
+    body_obj = {"Serial_number": str(serial), "organization": str(organization)}
+    body = json.dumps(body_obj).encode("utf-8")
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+
+    if username and password:
+        b = f"{username}:{password}".encode("utf-8")
+        headers["Authorization"] = "Basic " + base64.b64encode(b).decode("ascii")
+        log.info("Using bootstrap basic auth user=%s", username)
+
+    log.info("Bootstrap POST %s (host=%s port=%s path=%s)", bootstrap_url, host, port, path)
+    ctx = create_ssl_context(ca_file)
+
+    conn = http.client.HTTPSConnection(host, port=port, context=ctx, timeout=10)
+    try:
+        conn.request("POST", path, body=body, headers=headers)
+        resp = conn.getresponse()
+        data = resp.read()
+        status = resp.status
+        text = data.decode("utf-8", errors="replace")
+        log.info("Bootstrap HTTP status: %s", status)
+        if status >= 400:
+            log.error("Bootstrap error body: %s", text)
+            raise RuntimeError(f"Bootstrap request failed: {status}")
+        try:
+            j = json.loads(text)
+        except Exception:
+            log.error("Bootstrap response not JSON: %s", text)
+            raise
+        log.info("Bootstrap JSON: %s", json.dumps(j, indent=2))
+        return j
+    finally:
+        conn.close()
+
+def run_mqtt_connect(broker_host, broker_port, ca_file, mqtt_user, mqtt_password, client_id, tenant_id):
+    # build username as tenant/user if tenant_id present
+    if tenant_id and mqtt_user:
+        username = f"{tenant_id}/{mqtt_user}"
+    else:
+        username = mqtt_user
+
+    log.info("MQTT connect to %s:%s client_id=%s username=%s", broker_host, broker_port, client_id, username)
+    client = mqtt.Client(client_id=client_id, protocol=mqtt.MQTTv31, clean_session=True)
+
+    if username and mqtt_password:
+        client.username_pw_set(username, mqtt_password)
+    else:
+        log.warning("No MQTT username/password provided - expect CONNACK 5")
+
+    # TLS context - require CA
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.options |= ssl.OP_NO_TLSv1
+    ctx.options |= ssl.OP_NO_TLSv1_1
+    if ca_file:
+        ctx.load_verify_locations(cafile=ca_file)
+        log.info("Loaded CA for MQTT: %s", ca_file)
+    client.tls_set_context(ctx)
+    client.tls_insecure_set(False)
+
+    def on_connect(c, userdata, flags, rc):
+        code_map = {0:"ok",1:"unacceptable protocol",2:"id rejected",3:"server unavailable",4:"bad user/pw",5:"not authorized"}
+        log.info("on_connect rc=%s -> %s", rc, code_map.get(rc, "unknown"))
+        if rc == 0:
+            payload = {"SerialNumber": client_id, "Timestamp": int(time.time())}
+            c.publish("s/us", json.dumps(payload), qos=1)
+            log.info("Published bootstrap payload")
+            c.subscribe(f"device/{client_id}/#")
+
+    def on_message(c, userdata, msg):
+        try:
+            txt = msg.payload.decode("utf-8", errors="replace")
+            log.info("Message on %s: %s", msg.topic, txt)
+        except Exception:
+            log.exception("msg decode error")
+
+    def on_disconnect(c, userdata, rc):
+        log.warning("Disconnected rc=%s", rc)
+
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.on_disconnect = on_disconnect
+
+    try:
+        client.connect(broker_host, broker_port, keepalive=60)
+    except Exception as e:
+        log.exception("MQTT socket connect failed: %s", e)
+        return
+    try:
+        client.loop_forever()
+    except KeyboardInterrupt:
+        log.info("User interrupted - disconnecting")
+        client.disconnect()
+
+def main():
+    env = load_json(ENV_FILE)
+    bootstrap_url = build_bootstrap_url(env)
+    ca_file = find_ca(env)
+    bootstrap_user = env.get("BootstrapUsername") or env.get("BootstrapUser") or env.get("RemoteServiceBootstrapBrokerUsername")
+    bootstrap_pass = env.get("BootstrapPassword") or env.get("RemoteServiceBootstrapBrokerPassword")
+    serial = env.get("SerialNumber") or env.get("serialNumber") or "unknown-serial"
+    org = (env.get("RemoteServiceOwnershipInfo") or {}).get("organization") or env.get("organization") or "Service"
+
+    if not bootstrap_url:
+        log.error("Cannot determine bootstrap URL. Add BootstrapUrl or BootstrapHost in env.json.")
+        return
+
+    try:
+        resp = bootstrap_post(bootstrap_url, bootstrap_user, bootstrap_pass, serial, org, ca_file)
+    except Exception as e:
+        log.error("Bootstrap failed: %s", e)
+        return
+
+    # parse expected keys
+    user = resp.get("user_id") or resp.get("user") or resp.get("username")
+    pwd = resp.get("password")
+    tenant_url = resp.get("tenant_url") or resp.get("tenantUrl") or resp.get("tenant_url")
+    tenant_id = resp.get("tenant_id") or resp.get("tenantId") or resp.get("tenant_id")
+
+    if tenant_url:
+        parsed = urlparse(tenant_url)
+        broker_host = parsed.hostname or parsed.path
+        broker_port = parsed.port or 8883
+    else:
+        # fallback to env
+        broker_host = env.get("RemoteServiceBootstrapBrokerHostName") or env.get("MQTTHostname") or "localhost"
+        broker_port = int(env.get("SecureMQTTPort") or env.get("RemoteServiceBootstrapBrokerPort") or 8883)
+
+    log.info("Bootstrap provided mqtt user=%s tenant=%s broker=%s:%s", user, tenant_id, broker_host, broker_port)
+
+    if not user or not pwd:
+        log.error("Bootstrap did not return credentials (user/password). Aborting MQTT connect.")
+        return
+
+    run_mqtt_connect(broker_host, broker_port, ca_file, user, pwd, serial, tenant_id)
+
+if __name__ == "__main__":
+    main()
