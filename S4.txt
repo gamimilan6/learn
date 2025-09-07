@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""
+connect_with_env.py
+
+Connect to a server using credentials from env.json and send ONLY:
+{"Serial_number": "<serial>", "organization": "<org>"}
+
+- Looks for:
+  BootstrapUrl  (preferred)  OR  BootstrapHost [+ BootstrapPort] + BootstrapPath
+  BootstrapUsername / BootstrapPassword   (optional Basic Auth)
+  linuxCaFileName OR RootCAName           (optional CA file to verify TLS)
+  SerialNumber and organization           (organization may be under RemoteServiceOwnershipInfo)
+- Uses stdlib (http.client + ssl) — no external deps.
+
+Place this script next to env.json (and your CA file if any) and run:
+    python connect_with_env.py
+"""
+
+import json
+import base64
+import ssl
+import http.client
+from pathlib import Path
+from urllib.parse import urlparse
+import logging
+import sys
+
+# ---------- logging ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger("connect-env")
+
+BASE = Path(__file__).parent
+ENV_PATH = BASE / "env.json"
+
+# ---------- helpers ----------
+def load_env():
+    if not ENV_PATH.exists():
+        log.error("env.json not found at %s", ENV_PATH)
+        sys.exit(1)
+    try:
+        return json.loads(ENV_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.exception("Failed to parse env.json: %s", e)
+        sys.exit(1)
+
+def pick_ca_file(env):
+    for key in ("linuxCaFileName", "Linuxcafilename", "linuxcafilename", "RootCAName", "rootCAName", "RootCA"):
+        val = env.get(key)
+        if not val:
+            continue
+        p = Path(val)
+        if p.is_file():
+            return str(p)
+        rp = BASE / val
+        if rp.is_file():
+            return str(rp)
+    return None  # fall back to system CA store
+
+def build_url(env):
+    # Prefer a full URL if provided
+    full = env.get("BootstrapUrl") or env.get("BootstrapAgentUrl") or env.get("bootstrapUrl")
+    if full:
+        return full
+
+    # Else host + path (+ optional port)
+    host = env.get("BootstrapHost") or env.get("BootstrapServer") or env.get("RemoteServiceBootstrapBrokerHostName")
+    path = env.get("BootstrapPath") or env.get("BootstrapAgentPath") or env.get("bootstrapPath") or "/bootstrapAgent"
+    if not host:
+        return None
+
+    # If host already includes scheme, just append path
+    if host.startswith("http://") or host.startswith("https://"):
+        return host.rstrip("/") + path
+
+    port = env.get("BootstrapPort") or env.get("bootstrapPort")
+    if port:
+        try:
+            port = int(port)
+            return f"https://{host.rstrip('/')}:{port}{path}"
+        except Exception:
+            log.warning("BootstrapPort is not an integer: %s (ignoring)", port)
+    return f"https://{host.rstrip('/')}{path}"
+
+def create_ssl_context(ca_file):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    # disable legacy protocols
+    ctx.options |= ssl.OP_NO_TLSv1
+    ctx.options |= ssl.OP_NO_TLSv1_1
+    if ca_file:
+        ctx.load_verify_locations(cafile=ca_file)
+        log.info("Using CA file: %s", ca_file)
+    else:
+        log.info("No CA file in env.json — using system CA store")
+    return ctx
+
+def post_json(url, payload, ca_file=None, username=None, password=None, timeout=15):
+    parsed = urlparse(url)
+    scheme = parsed.scheme or "https"
+    host = parsed.hostname
+    port = parsed.port or (443 if scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+
+    if username and password:
+        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+        headers["Authorization"] = "Basic " + token
+        log.info("Using Basic Auth (username present)")
+
+    log.info("POST -> %s (host=%s port=%s path=%s)", url, host, port, path)
+    ctx = create_ssl_context(ca_file)
+
+    conn = None
+    try:
+        conn = http.client.HTTPSConnection(host, port=port, context=ctx, timeout=timeout) if scheme == "https" \
+               else http.client.HTTPConnection(host, port=port, timeout=timeout)
+        conn.request("POST", path, body=body, headers=headers)
+        resp = conn.getresponse()
+        status = resp.status
+        text = resp.read().decode("utf-8", errors="replace")
+        log.info("HTTP status: %s", status)
+        # try to pretty print JSON
+        try:
+            parsed_json = json.loads(text)
+            log.info("Response (JSON):\n%s", json.dumps(parsed_json, indent=2))
+        except Exception:
+            log.info("Response (text):\n%s", text)
+        return status, text
+    finally:
+        if conn:
+            conn.close()
+
+# ---------- main ----------
+def main():
+    env = load_env()
+
+    # Serial & org (org may be nested)
+    serial = env.get("SerialNumber") or env.get("serialNumber") or env.get("Serial_number") or env.get("serial_number")
+    org = None
+    rso = env.get("RemoteServiceOwnershipInfo")
+    if isinstance(rso, dict):
+        org = rso.get("organization") or rso.get("Organization")
+    if not org:
+        org = env.get("organization") or env.get("Organization")
+
+    if not serial:
+        log.error("Serial number not found in env.json (expected: SerialNumber / serialNumber / Serial_number).")
+        sys.exit(1)
+    if org is None:
+        log.warning("Organization not found in env.json — sending empty organization.")
+
+    url = build_url(env)
+    if not url:
+        log.error("Server URL not found. Set either 'BootstrapUrl' OR 'BootstrapHost' (+ optional 'BootstrapPort') + 'BootstrapPath' in env.json.")
+        sys.exit(1)
+
+    ca_file = pick_ca_file(env)
+    user = env.get("BootstrapUsername") or env.get("BootstrapUser") or env.get("RemoteServiceBootstrapBrokerUsername")
+    pwd  = env.get("BootstrapPassword") or env.get("BootstrapPass") or env.get("RemoteServiceBootstrapBrokerPassword")
+
+    payload = {
+        "Serial_number": str(serial),
+        "organization": "" if org is None else str(org)
+    }
+
+    status, _ = post_json(url, payload, ca_file=ca_file, username=user, password=pwd)
+    log.info("Done (HTTP %s).", status)
+
+if __name__ == "__main__":
+    main()
