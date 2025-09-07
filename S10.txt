@@ -1,0 +1,21 @@
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+import time
+
+# Launch browser (make sure chromedriver is installed)
+driver = webdriver.Chrome()
+
+# Load URL
+driver.get("https://your-server.com")
+
+# Wait for page to load
+time.sleep(5)
+
+# Try to find tenant ID field or label
+try:
+    elem = driver.find_element(By.ID, "tenant")   # if input has id="tenant"
+    print("Found tenant field:", elem)
+except:
+    print("Tenant field not found")
+
+driver.quit()
